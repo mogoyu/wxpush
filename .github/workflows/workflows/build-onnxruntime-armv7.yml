@@ -1,0 +1,109 @@
+name: Build onnxruntime for ARMv7l (Python 3.11)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-onnxruntime-armv7.yml'
+
+jobs:
+  build-armv7-py311:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+        with:
+          platforms: arm/v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build onnxruntime Wheel (Py3.11)
+        run: |
+          # 创建用于构建的 Dockerfile
+          # 注意：这里使用了 python:3.11-bullseye 作为基础，因为 balenalib 的 3.11 armv7 镜像可能较少见或构建慢
+          # 如果 balenalib 有 raspberrypi3-python:3.11 也可以替换回去，但 debian 官方镜像更稳妥
+          cat <<EOF > Dockerfile.build
+          FROM --platform=linux/arm/v7 python:3.11-bullseye
+
+          ARG ONNXRUNTIME_VERSION=1.16.3
+          ARG PYTHON_VERSION=3.11
+
+          # 安装系统级依赖
+          RUN apt-get update && apt-get install -y \
+              build-essential \
+              cmake \
+              git \
+              wget \
+              libssl-dev \
+              libffi-dev \
+              libopenblas-dev \
+              libeigen3-dev \
+              zip \
+              zlib1g-dev \
+              pkg-config \
+              && rm -rf /var/lib/apt/lists/*
+
+          # 升级 pip 和安装构建依赖
+          RUN python -m pip install --upgrade pip setuptools wheel numpy cython packaging sympy flatbuffers
+
+          # 克隆 onnxruntime 源码
+          WORKDIR /source
+          RUN git clone --depth 1 --branch v${ONNXRUNTIME_VERSION} --recursive https://github.com/microsoft/onnxruntime.git
+
+          WORKDIR /source/onnxruntime
+
+          # 执行编译
+          # 关键点：
+          # 1. --arm_version 7 : 强制 ARMv7 (armv7l)
+          # 2. --use_openblas : 使用 OpenBLAS 加速
+          # 3. --parallel 2 : 限制并行数以节省内存 (ARMv7 编译非常吃内存，设太高容易 OOM)
+          RUN python build.sh \
+              --config Release \
+              --update \
+              --build \
+              --build_wheel \
+              --use_openblas \
+              --arm_version 7 \
+              --skip_tests \
+              --enable_pybind \
+              --parallel 2
+
+          # 提取生成的 .whl 文件
+          WORKDIR /source/onnxruntime/build/Linux/Release/dist
+          RUN ls -lh *.whl
+          RUN mkdir -p /output && cp *.whl /output/
+          EOF
+
+          # 创建输出目录
+          mkdir -p output
+
+          # 执行 Docker 构建
+          # 显式指定平台为 linux/arm/v7
+          docker buildx build --platform linux/arm/v7 -t onnxruntime-builder-py311 --load .
+
+          # 从构建好的镜像中提取 .whl 文件
+          CONTAINER_ID=$(docker create onnxruntime-builder-py311)
+          docker cp $CONTAINER_ID:/output/. ./output/
+          docker rm $CONTAINER_ID
+
+          # 显示生成的文件，确认版本号包含 cp311
+          echo "Build completed. Checking file name:"
+          ls -lh output/
+          if ls output/*cp311*.whl 1> /dev/null 2>&1; then
+            echo "✅ Success: Found cp311 wheel!"
+          else
+            echo "❌ Error: No cp311 wheel found! Check build logs."
+            exit 1
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: onnxruntime-armv7l-py311-wheels
+          path: output/*.whl
+          retention-days: 7
